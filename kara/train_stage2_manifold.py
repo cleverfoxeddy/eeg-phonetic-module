@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import xgboost as xgb
+import pickle
 from sklearn.multioutput import MultiOutputClassifier  # kept for potential future use
 from torch.utils.data import DataLoader, TensorDataset
 import argparse
@@ -334,6 +335,13 @@ def train_phase2(train_features, val_features, device, args):
     else:
         best_path = os.path.join(args.ckpt_dir, f"phase2_best_sid{int(sid)}.pt")
 
+    # ── Phase2 resume: skip training if checkpoint already exists ──────────────
+    if args.resume and os.path.isfile(best_path):
+        print(f"  [Phase2] Resuming from existing checkpoint: {best_path}")
+        model.load_state_dict(torch.load(best_path, map_location=device))
+        return model
+    # ──────────────────────────────────────────────────────────────────────────
+
     for epoch in range(1, args.epochs_phase2 + 1):
         model.train()
         for (x_clean,) in train_loader:
@@ -392,8 +400,58 @@ def _tune_thresholds_on_val(models, val_x, val_y, thr_min, thr_max, thr_steps):
     return np.array(thresholds, dtype=np.float32)
 
 
+def _phase3_ckpt_path(args):
+    """Return the pickle path for Phase3 XGB checkpoint."""
+    sid = getattr(args, "current_test_sid", None)
+    if sid is None:
+        return os.path.join(args.ckpt_dir, "phase3_xgb.pkl")
+    return os.path.join(args.ckpt_dir, f"phase3_xgb_sid{int(sid)}.pkl")
+
+
+def save_phase3(models, thresholds, args):
+    """Persist XGB models + tuned thresholds to disk via pickle."""
+    path = _phase3_ckpt_path(args)
+    payload = {"models": models, "thresholds": thresholds}
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+    print(f"  [Phase3] Checkpoint saved → {path}")
+
+
+def load_phase3(args):
+    """Load XGB models + thresholds from disk. Returns (models, thresholds) or None."""
+    path = _phase3_ckpt_path(args)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    print(f"  [Phase3] Checkpoint loaded ← {path}")
+    return payload["models"], payload["thresholds"]
+
+
 def train_phase3(train_latent, train_labels, val_latent, val_labels, test_latent, test_labels, args):
-    """Per-task XGBoost with optional scale_pos_weight + val-tuned thresholds."""
+    """Per-task XGBoost with optional scale_pos_weight + val-tuned thresholds.
+
+    Checkpoint behaviour
+    --------------------
+    * ``--resume``:  if a Phase3 checkpoint already exists for this fold,
+      skip training entirely and evaluate straight from the saved models.
+    * ``--save_phase3`` (default True):  after training, persist the fitted
+      models + tuned thresholds so they can be resumed later.
+    """
+
+    # ── Phase3 resume ─────────────────────────────────────────────────────────
+    if args.resume:
+        cached = load_phase3(args)
+        if cached is not None:
+            models, thresholds = cached
+            pred = np.stack(
+                [(m.predict_proba(test_latent)[:, 1] >= thresholds[t]).astype(int)
+                 for t, m in enumerate(models)], axis=1
+            )
+            acc_per_task = (pred == test_labels.astype(int)).mean(axis=0)
+            return models, float(acc_per_task.mean()), acc_per_task, thresholds
+    # ──────────────────────────────────────────────────────────────────────────
+
     models = []
     for t in range(train_labels.shape[1]):
         y_tr = train_labels[:, t].astype(int)
@@ -423,6 +481,11 @@ def train_phase3(train_latent, train_labels, val_latent, val_labels, test_latent
     )
     if args.print_thresholds:
         print(f"[Phase3] tuned thresholds={thresholds.round(3).tolist()}")
+
+    # ── save checkpoint ────────────────────────────────────────────────────────
+    if args.save_phase3:
+        save_phase3(models, thresholds, args)
+    # ──────────────────────────────────────────────────────────────────────────
 
     pred = np.stack(
         [(m.predict_proba(test_latent)[:, 1] >= thresholds[t]).astype(int)
@@ -487,6 +550,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split_mode", type=str, default="loso_cv", choices=["precomputed", "subject", "trial", "loso_cv"])
     parser.add_argument("--loso_sid", type=int, default=None)
+
+    # ── checkpoint / resume ────────────────────────────────────────────────────
+    parser.add_argument("--resume", action="store_true",
+                        help="If set, skip Phase2/Phase3 training when a checkpoint already exists "
+                             "for the current fold and load from disk instead.")
+    parser.add_argument("--save_phase3", action="store_true", default=True,
+                        help="Persist Phase3 XGB models + thresholds after training (default: True). "
+                             "Disable with --no_save_phase3.")
+    parser.add_argument("--no_save_phase3", dest="save_phase3", action="store_false",
+                        help="Do NOT save Phase3 XGB checkpoint.")
+    # ──────────────────────────────────────────────────────────────────────────
 
     # paper-aligned feature knobs
     parser.add_argument("--channel_mode", type=str, default="all", choices=["paper10", "all"])
@@ -612,7 +686,7 @@ def main():
                 continue
 
             args.n_channels = infer_n_channels(tr_ds)
-            # Stash fold id so train_phase1/2 can write fold-specific checkpoints.
+            # Stash fold id so train_phase1/2/3 can write fold-specific checkpoints.
             args.current_test_sid = int(test_sid)
             print(f"\n=== Evaluating LOSO fold | Test SID: {test_sid} | C={args.n_channels} ===")
             acc, acc_per_task = run_pipeline(tr_ds, va_ds, te_ds, device, args)
