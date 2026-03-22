@@ -14,7 +14,7 @@
 ## Poster
 
 <p align="center">
-  <img src="poster_preview.png" width="100%" alt="Research Poster"/>
+  <img src="karaone_poster_final.png" width="100%" alt="Research Poster"/>
 </p>
 
 > Full-resolution HTML poster: [`karaone_poster_final.html`](karaone_poster_final.html)
